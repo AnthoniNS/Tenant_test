@@ -1,0 +1,239 @@
+x-php: &php
+  build:
+    context: .
+    dockerfile: ./conf/docker/php/php.dockerfile
+    args:
+      ENVIRONMENT: development
+  restart: unless-stopped
+  working_dir: /srv
+  volumes:
+    - ./www/core_tenant:/srv
+    - ~/www/core_tenant/.composer:/home/composer/.cache/composer
+    - ~/www/core_tenant/.composer/auth.json:/config/composer/auth.json
+    - ./www/core_tenant/vendor:/srv/vendor
+    - ./conf/traefik:/srv/traefik
+    - ./conf:/srv/conf
+  depends_on:
+    - mysql
+  networks:
+    - minharede
+
+services:
+  traefik:
+    image: traefik:v3.0
+    restart: unless-stopped
+    command: >-
+      --entryPoints.web.address=:80
+      --entryPoints.web.http.redirections.entrypoint.to=web-secure
+      --entryPoints.web.http.redirections.entrypoint.scheme=https
+      --entryPoints.web-secure.address=:443
+      --api=true
+      --api.dashboard=true
+      --providers.docker=true
+      --providers.docker.exposedByDefault=false
+      --providers.file.directory=/srv/configs
+      --providers.file.watch=true
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./conf/traefik:/srv
+    labels:
+      - traefik.enable=true
+
+      # CORS Full Access
+      - traefik.http.middlewares.cors.headers.accessControlAllowOrigin=*
+      - traefik.http.middlewares.cors.headers.accessControlAllowMethods=GET,POST,PUT,DELETE,OPTIONS
+      - traefik.http.middlewares.cors.headers.accessControlAllowHeaders=*
+      - traefik.http.middlewares.cors.headers.accessControlAllowCredentials=true
+      - traefik.http.middlewares.cors.headers.accessControlExposeHeaders=*
+      - traefik.http.middlewares.cors.headers.accessControlMaxAge=86400
+
+      # Permitir ser exibido em iframe
+      - traefik.http.middlewares.cors.headers.customResponseHeaders.Content-Security-Policy=frame-ancestors *
+      - traefik.http.middlewares.cors.headers.customResponseHeaders.X-Frame-Options=ALLOWALL
+
+      # Roteamento
+      - traefik.http.routers.app.middlewares=cors@docker
+      - traefik.http.routers.traefik.rule=Host(`traefik.docker.localhost`)
+      - traefik.http.routers.traefik.service=api@internal
+      - traefik.http.routers.traefik.tls=true
+      - traefik.http.services.traefik.loadBalancer.server.port=8080
+    networks:
+      - minharede
+  
+  mysql:
+    image: mysql:8.0-debian
+    container_name: mysql
+    restart: unless-stopped
+    volumes:
+      - ./www/core_tenant/sql:/docker-entrypoint-initdb.d
+      - mysql-data:/var/lib/mysql
+    environment:
+      MYSQL_DATABASE: db_core_tenant
+      MYSQL_ALLOW_EMPTY_PASSWORD: "false"
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
+    networks:
+      - minharede
+
+  php:
+    <<: *php
+    container_name: php
+    user: "root:root"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.php.entryPoints=web-secure
+      - traefik.http.routers.php.rule=Host(`app.localhost`)
+      - traefik.http.routers.php.tls=true
+    depends_on:
+      - mysql
+    networks:
+      - minharede
+
+  queue:
+    <<: *php
+    networks:
+      - minharede
+
+  scheduler:
+    <<: *php
+    command: supercronic /srv/conf/docker/php/config/schedule.cron
+    networks:
+      - minharede
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    networks:
+      - minharede
+
+  mailpit:
+    image: axllent/mailpit:v1.12
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.mailpit.entryPoints=web-secure
+      - traefik.http.routers.mailpit.rule=Host(`mailpit.app.localhost`)
+      - traefik.http.routers.mailpit.tls=true
+      - traefik.http.services.mailpit.loadBalancer.server.port=8025
+    networks:
+      - minharede
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    environment:
+      PMA_HOST: mysql
+      MYSQL_ROOT_PASSWORD: root
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.phpmyadmin.entryPoints=web-secure
+      - traefik.http.routers.phpmyadmin.rule=Host(`phpmyadmin.app.localhost`)
+      - traefik.http.routers.phpmyadmin.tls=true
+    depends_on:
+      - mysql
+    networks:
+      - minharede
+
+  pgadmin:
+    image: dpage/pgadmin4
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    networks:
+      - minharede
+
+  postgresql:
+    image: postgres:16
+    restart: always
+    volumes:
+      - ./conf/docker/postgres/postgresql.conf:/etc/postgresql/postgresql.conf
+      - postgres_data:/var/lib/postgresql/data
+      - ./conf/docker/postgres/init:/docker-entrypoint-initdb.d
+    env_file:
+      - ./conf/docker/postgres/.env
+    ports:
+      - '5432:5432'
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U administrator" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - minharede
+
+  typebotbuilder:
+    build:
+      context: ./www/typebot
+      args:
+        - SCOPE=builder
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    restart: always
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.typebotbuilder.entryPoints=web-secure
+      - traefik.http.routers.typebotbuilder.rule=Host(`typebot.app.localhost`)
+      - traefik.http.routers.typebotbuilder.tls=true
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    env_file: ./www/typebot/.env
+    networks:
+      - minharede
+
+  typebotviewer:
+    build:
+      context: ./www/typebot
+      args:
+        - SCOPE=viewer
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    restart: always
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.typebotviewer.entryPoints=web-secure
+      - traefik.http.routers.typebotviewer.rule=Host(`typebotviewer.app.localhost`)
+      - traefik.http.routers.typebotviewer.tls=true
+    env_file: ./www/typebot/.env
+    networks:
+      - minharede
+
+  evolution:  
+    image: atendai/evolution-api:v2.2.1 ## Versão da Evolution API
+    restart: unless-stopped
+    volumes:
+      - evolution_instances_data:/evolution/instances
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.evolution.entryPoints=web-secure
+      - traefik.http.routers.evolution.rule=Host(`evolution.app.localhost`)
+      - traefik.http.routers.evolution.tls=true
+    networks:
+      - minharede
+    env_file:
+      - ./www/evolution/.env
+
+
+volumes:
+  redis-data:
+  mysql-data:
+  typebot-data:
+  postgres_data:
+  evolution_instances_data:
+    driver: local
+
+networks:
+  minharede:
+    external: true
